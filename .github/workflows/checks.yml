@@ -1,0 +1,24 @@
+name: Check casks
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Check cask syntax and update safeguards
+        run: |
+          ruby -c Casks/openaway.rb
+          ruby -c Casks/nocaps.rb
+          ruby scripts/test-cask.rb
+          ruby scripts/test-release.rb

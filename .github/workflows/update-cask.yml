@@ -1,0 +1,86 @@
+name: Update OpenAway cask
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published OpenAway tag (leave empty for the latest stable release)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cask-update
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  update-cask:
+    runs-on: macos-26
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: phucisstupid/openaway
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+      - name: Test cask automation
+        run: |
+          ruby scripts/test-cask.rb
+          ruby scripts/test-release.rb
+      - name: Resolve release tag
+        run: |
+          set -euo pipefail
+          if [[ -z "$RELEASE_TAG" ]]; then
+            RELEASE_TAG=$(gh api --paginate 'repos/phucisstupid/openaway/releases?per_page=100' \
+              --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' \
+              | ruby -rrubygems -e 'tags = STDIN.each_line.map(&:strip).select { |tag| tag.match?(/\Av\d+\.\d+\.\d+\z/) }; abort "No stable release tags" if tags.empty?; puts tags.max_by { |tag| Gem::Version.new(tag.delete_prefix("v")) }')
+          fi
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
+          echo "RELEASE_TAG=$RELEASE_TAG" >> "$GITHUB_ENV"
+      - name: Sync cask with published release
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
+          UNPUBLISHED_OR_PRERELEASE=$(gh release view "$RELEASE_TAG" --json isDraft,isPrerelease --jq '.isDraft or .isPrerelease')
+          if [[ "$UNPUBLISHED_OR_PRERELEASE" != false ]]; then
+            echo "Skipping $RELEASE_TAG; only published stable releases can update the cask"
+            exit 0
+          fi
+          ASSET_DIR=$(mktemp -d)
+          trap 'rm -rf "$ASSET_DIR"' EXIT
+          gh release download "$RELEASE_TAG" --pattern 'OpenAway-macos-arm64.zip' --pattern 'OpenAway-macos-arm64.zip.sha256' --dir "$ASSET_DIR"
+          [[ "$(wc -l < "$ASSET_DIR/OpenAway-macos-arm64.zip.sha256")" -eq 1 ]] || exit 1
+          read -r CHECKSUM ASSET_NAME < "$ASSET_DIR/OpenAway-macos-arm64.zip.sha256"
+          [[ "$CHECKSUM" =~ ^[a-f0-9]{64}$ && "$ASSET_NAME" == "OpenAway-macos-arm64.zip" ]] || exit 1
+          (cd "$ASSET_DIR" && shasum -a 256 -c OpenAway-macos-arm64.zip.sha256)
+          mkdir "$ASSET_DIR/verify"
+          ditto -x -k "$ASSET_DIR/OpenAway-macos-arm64.zip" "$ASSET_DIR/verify"
+          APP="$ASSET_DIR/verify/OpenAway.app"
+          APP_VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")
+          [[ "$RELEASE_TAG" == "v$APP_VERSION" ]] || exit 1
+          codesign --verify --deep --strict "$APP"
+          [[ "$(lipo -archs "$APP/Contents/MacOS/OpenAway")" == arm64 ]] || exit 1
+          ruby scripts/update-cask.rb "${RELEASE_TAG#v}" "$CHECKSUM" Casks/openaway.rb
+          ruby -c Casks/openaway.rb
+      - name: Commit cask update
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- Casks/openaway.rb; then
+            echo "No cask update needed"
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Casks/openaway.rb
+          git commit -m "Update OpenAway cask to ${RELEASE_TAG#v}"
+          git push origin "HEAD:$DEFAULT_BRANCH"
